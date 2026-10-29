@@ -95,7 +95,11 @@ Lfm2AudioOutput::Lfm2AudioOutput(const MultiModalLanguageModel& model, const Gen
 
 void Lfm2AudioOutput::BeginStep(DeviceSpan<int32_t>& next_tokens, bool is_prompt) {
   if (is_prompt || next_tokens.size() != 1) {
-    // A new turn starts in text, whatever the last one ended in.
+    // A new turn starts in text, whatever the last one ended in. A frame still pending here was
+    // sampled after the last placeholder in the sequence ran, so no placeholder holds it.
+    if (HasPendingFrame() && pending_in_codes_) {
+      audio_codes_.resize(audio_codes_.size() - static_cast<size_t>(config_.num_codebooks));
+    }
     modality_ = Modality::Text;
     previous_was_text_ = false;
     text_done_ = false;
@@ -176,6 +180,7 @@ DeviceSpan<float> Lfm2AudioOutput::SampleFrame(OrtValue& hidden_states) {
   } else {
     audio_codes_.insert(audio_codes_.end(), frame.begin(), frame.end());
   }
+  pending_in_codes_ = frame[0] != end_of_audio;
 
   EmbedFrame(frame);
   return placeholder_logits_;
