@@ -18,6 +18,7 @@ namespace {
 
 constexpr char kProcessorName[] = "Lfm3AudioProcessor";
 constexpr double kLogMelFloor = -12.0;
+constexpr double kMinBandPower = 1e-12;  // 10^kLogMelFloor
 constexpr double kNormalizationOffset = 4.0;
 constexpr double kNormalizationDivisor = 4.0;
 
@@ -56,7 +57,8 @@ std::vector<float> ComputeLfm3AudioMel(const float* pcm, int64_t num_samples, co
       for (size_t k = 0; k < power.size(); ++k) {
         band_power += static_cast<double>(filters[m][k]) * power[k];
       }
-      const double log_mel = std::max(std::log10(band_power), kLogMelFloor);
+      // Skips log10(0), whose divide-by-zero flag traps in hosts that unmask it.
+      const double log_mel = band_power <= kMinBandPower ? kLogMelFloor : std::log10(band_power);
       mel[m * frames + t] = static_cast<float>((log_mel + kNormalizationOffset) / kNormalizationDivisor);
     }
   }

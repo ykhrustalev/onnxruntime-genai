@@ -536,8 +536,11 @@ def test_lfm3_audio_text_second_turn_generates_and_a_second_clip_raises(test_dat
     generator.generate_next_token()
     assert generator.get_sequence(0).shape[0] > length + 1
 
-    with pytest.raises(RuntimeError):
+    length = generator.get_sequence(0).shape[0]
+    with pytest.raises(RuntimeError, match="SetInputs got images or audio after"):
         generator.set_inputs(processor(AUDIO_MARKER, audios=og.Audios.open(*_clips(tmp_path, 1600))))
+    generator.generate_next_token()
+    assert generator.get_sequence(0).shape[0] == length + 1
 
 
 def test_lfm3_audio_casts_the_mel_to_the_speech_input_type(test_data_path, tmp_path):

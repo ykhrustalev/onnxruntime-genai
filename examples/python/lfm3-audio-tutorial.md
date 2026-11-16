@@ -92,7 +92,7 @@ Audio files are decoded by onnxruntime-extensions (WAV, FLAC, MP3), mixed down t
 ## 4. What the runtime does not do
 
 - Speech output. A prompt with `<|audio_out|>` is refused, and the tokens that switch to speech end the text answer.
-- Audio after the first `set_inputs`. A later `set_inputs` with a clip fails inside ONNX Runtime and leaves the generator unusable, so discard it. Later turns can add text that starts with `<|im_end|>`, since the generator does not add the token that ended the previous answer.
+- Audio after the first `set_inputs`. A later `set_inputs` with a clip is refused with an error, and the generator stays usable. For a new clip, create a new generator. Later turns can add text that starts with `<|im_end|>`, since the generator does not add the token that ended the previous answer.
 - Batches above 1 and beam search. Both are refused when the generator is created.
 - `rewind_to`. It is refused, as for the other LFM2 and LFM3 models.
 - A limit on clip length. Memory grows with the clip.
