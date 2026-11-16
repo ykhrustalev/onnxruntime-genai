@@ -440,10 +440,11 @@ def _builder_tests():
     return builder_tests
 
 
-def _build_stand_in_pipeline(test_data_path, tmp_path, ep="cpu", io_dtype=None, extra_options=None):
-    """The builder's lfm3_vl pipeline for the stand-in checkpoint of the builder tests, with this model's tokenizer."""
+def _build_stand_in_pipeline(test_data_path, tmp_path, ep="cpu", io_dtype=None, extra_options=None, d1=False):
+    """The builder's lfm3_vl pipeline for the stand-in checkpoint of the builder tests, with this model's tokenizer.
+    With d1, the checkpoint is d1-2B's."""
     builder_tests = _builder_tests()
-    config = builder_tests.stand_in_config(tmp_path)
+    config = (builder_tests.d1_stand_in_config if d1 else builder_tests.stand_in_config)(tmp_path)
     config.text_config.max_position_embeddings = 1024  # Room for the two images' 160 tokens
     config.text_config.head_dim = 16  # GroupQueryAttention runs head sizes that are multiples of 8
     tokenizer = json.loads((Path(_model_path(test_data_path)) / "tokenizer.json").read_text(encoding="utf-8"))

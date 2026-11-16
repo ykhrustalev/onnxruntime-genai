@@ -331,6 +331,11 @@ class LFM3VLModel(LFM2VLModel):
         # TODO: allow other EPs once a real LFM3-VL model has run on them.
         if ep not in {"cpu", "cuda", "webgpu"}:
             raise NotImplementedError(f"The lfm3_vl pipeline runs on cpu, cuda and webgpu for now, not {ep}.")
+        self.d1_vision_max_pixels = None
+        if config.architectures[0] == "D1Model":
+            if not isinstance(getattr(config, "d1_vision_max_pixels", None), int):
+                raise ValueError("D1Model needs d1_vision_max_pixels, the pixel limit of its images, in config.json")
+            self.d1_vision_max_pixels = config.d1_vision_max_pixels
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
         # The longest side smart_resize can give, in patches. It refuses aspect ratios above 200 and keeps the area
@@ -411,6 +416,21 @@ class LFM3VLModel(LFM2VLModel):
                 merge_size=merge_size,
             ),
         ]
+        if self.d1_vision_max_pixels is not None:
+            # d1-2B first shrinks a larger image to d1_vision_max_pixels with bicubic resampling, truncating each side
+            # to an integer, and never enlarges one. A smart_resize to multiples of 1 with no lower limit does that,
+            # though it divides where d1 multiplies, so for some sizes a side is one pixel off.
+            cap = step(
+                "d1_max_pixels",
+                "Resize",
+                interpolation="CUBIC",
+                smart_resize=1,
+                min_pixels=0,
+                max_pixels=self.d1_vision_max_pixels,
+                patch_size=1,
+                merge_size=1,
+            )
+            transforms.insert(1, cap)
         return {"processor": {"name": "lfm3_vl_image_processor", "transforms": transforms}}
 
     def make_vision_section(self):

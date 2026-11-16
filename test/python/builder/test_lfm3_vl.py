@@ -102,6 +102,21 @@ def stand_in_config(tmp_path):
     return config
 
 
+# d1-2B's pixel limit at the stand-in's size, between the image processor's limits: images above 128x128 pixels shrink
+# before the image processor runs.
+D1_MAX_PIXELS = 16384
+
+
+def d1_stand_in_config(tmp_path):
+    """d1-2B's config.json: an LFM3-VL one with another architecture and the d1 fields the builder reads."""
+    config = stand_in_config(tmp_path)
+    config.architectures = ["D1Model"]
+    config.model_type = "lfm3_vl"
+    config.d1_attention = "set"
+    config.d1_vision_max_pixels = D1_MAX_PIXELS
+    return config
+
+
 def write_image_processor(tmp_path, **overrides):
     """The image processor settings of a checkpoint, in the checkpoint's nested file layout."""
     path = tmp_path / "checkpoint"
@@ -440,13 +455,18 @@ def test_base_revision_reaches_every_checkpoint_read(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
+    "make_config, loader",
+    [(stand_in_config, "AutoModelForImageTextToText"), (d1_stand_in_config, "AutoModel")],
+    ids=["lfm3_vl", "d1"],
+)
+@pytest.mark.parametrize(
     "exclude_embeds, builder_name, model_type",
     [(True, "LFM3VLModel", "lfm3_vl"), (False, "LFM3Model", "lfm3")],
 )
 def test_architecture_picks_the_pipeline_or_the_text_model(
-    monkeypatch, tmp_path, exclude_embeds, builder_name, model_type
+    monkeypatch, tmp_path, exclude_embeds, builder_name, model_type, make_config, loader
 ):
-    config = stand_in_config(tmp_path)
+    config = make_config(tmp_path)
     write_image_processor(tmp_path)
     captured = {}
 
@@ -479,11 +499,7 @@ def test_architecture_picks_the_pipeline_or_the_text_model(
         hf_details={"extra_kwargs": {}, "hf_name": config.name_or_path, "hf_config": config},
     )
 
-    assert captured == {
-        "builder": builder_name,
-        "loaders": {"AutoModelForImageTextToText"},
-        "model_type": model_type,
-    }
+    assert captured == {"builder": builder_name, "loaders": {loader}, "model_type": model_type}
 
 
 def test_genai_config_and_processor_config(tmp_path):
@@ -552,3 +568,70 @@ def test_refuses_before_building(tmp_path, case, error, message):
     options = {"exclude_embeds": True, **case.get("options", {})}
     with pytest.raises(error, match=message):
         LFM3VLModel(config, dtype, dtype, case.get("ep", "cpu"), str(tmp_path / "cache"), options)
+
+
+def test_d1_processor_config_caps_the_pixels_first(tmp_path):
+    # d1-2B's own code shrinks each image to d1_vision_max_pixels before its image processor runs.
+    write_image_processor(tmp_path)
+    options = {"exclude_embeds": True}
+    transforms = {
+        name: LFM3VLModel(make_config(tmp_path), FP32, FP32, "cpu", str(tmp_path / "cache"), options).processor_config[
+            "processor"
+        ]["transforms"]
+        for name, make_config in (("lfm3_vl", stand_in_config), ("d1", d1_stand_in_config))
+    }
+
+    cap = transforms["d1"].pop(1)
+    assert cap == {
+        "operation": {
+            "name": "d1_max_pixels",
+            "type": "Resize",
+            "attrs": {
+                "interpolation": "CUBIC",
+                "smart_resize": 1,
+                "min_pixels": 0,
+                "max_pixels": D1_MAX_PIXELS,
+                "patch_size": 1,
+                "merge_size": 1,
+            },
+        }
+    }
+    assert transforms["d1"] == transforms["lfm3_vl"]
+
+
+@pytest.mark.parametrize("ep, dtype", [("cpu", FP32), ("cuda", FP16)])
+def test_d1_pipeline_decoder_reads_the_whole_prompt(tmp_path, ep, dtype):
+    config = d1_stand_in_config(tmp_path)
+    model, _ = build_pipeline(tmp_path, config, dtype, dtype, ep, {"exclude_embeds": True})
+
+    assert model.decoder.model_type == "lfm3_vl"
+    attention = {
+        node.name.split("/")[2]: node.attributes.get("causal")
+        for node in model.decoder.model.graph
+        if node.op_type == "GroupQueryAttention"
+    }
+    expected = {
+        f"layers.{layer_id}": layer_type
+        for layer_id, layer_type in enumerate(config.text_config.layer_types)
+        if layer_type != "conv"
+    }
+    assert {name: None if value is None else value.value for name, value in attention.items()} == {
+        name: 0 if layer_type == "full_attention" else None for name, layer_type in expected.items()
+    }
+
+
+@pytest.mark.parametrize(
+    "ep, dtype, overrides, error, message",
+    [
+        ("cpu", FP32, {"d1_vision_max_pixels": None}, ValueError, "needs d1_vision_max_pixels"),
+        ("webgpu", FP16, {}, NotImplementedError, "causal=0, which ONNX Runtime has on CPU and CUDA, not webgpu"),
+        ("cuda", FP16, {"d1_attention": "causal"}, NotImplementedError, "d1_attention=causal"),
+    ],
+)
+def test_d1_pipeline_refusals(tmp_path, ep, dtype, overrides, error, message):
+    config = d1_stand_in_config(tmp_path)
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    write_image_processor(tmp_path)
+    with pytest.raises(error, match=message):
+        LFM3VLModel(config, dtype, dtype, ep, str(tmp_path / "cache"), {"exclude_embeds": True})

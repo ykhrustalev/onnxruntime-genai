@@ -1,6 +1,6 @@
 # Run d1 decisions with ONNX Runtime GenAI
 
-Sections 1 to 7 are about d1-3B. [Section 8](#8-d1-2b) covers text decisions with d1-2B.
+Sections 1 to 7 are about d1-3B. [Section 8](#8-d1-2b) covers d1-2B, with text and with images.
 
 ## What d1-3B is
 
@@ -241,7 +241,7 @@ python d1-decisions.py -m ./d1-2b/cpu -r request.json
 }
 ```
 
-The script picks these from the model type, `lfm3`, to match d1-2B's own code:
+The script picks these from the model type, `lfm3` (or `lfm3_vl` for an export with images, see [d1-2B with images](#d1-2b-with-images)), to match d1-2B's own code:
 
 - Each question is a whole prompt. On d1-2B's 6 full-attention layers the state and the question read each other in both directions (GroupQueryAttention with `causal=0`), so a state is processed again for each question and `usage.input_tokens` counts it each time. The other 18 layers stay causal.
 - The prompt ends in an empty reasoning block, `<think></think>`.
@@ -253,7 +253,6 @@ The script picks these from the model type, `lfm3`, to match d1-2B's own code:
 What this does not do:
 
 - A choice with `"multiple": true` is refused: it needs one answer slot per option, and this script reads one position per question. The `text`, `number`, `date`, `box` and `boxes` types are refused for the same reason.
-- No images. The builder does not write the vision and embedding models of d1-2B yet, and it refuses `exclude_embeds=true` for this model.
 - One question per pass. d1's own code reads up to 16 questions in one pass (`d1_set_size` in its `config.json`), and its model card says larger sets are faster and cost some accuracy on text; only one question per pass was compared here.
 - WebGPU, JS and DirectML are refused by the builder, and `d1-decisions.py` refuses `-e WebGpuExecutionProvider`, because `causal=0` runs on CPU and CUDA only. ONNX Runtime 1.29 and older fail to load the model.
 - Do not generate text with this export: its full-attention layers read later tokens, so it is for one forward pass over a whole prompt.
@@ -270,3 +269,41 @@ Measured with `d1-decisions.py` (ONNX Runtime 1.31.0) against d1-2B's own `syste
 The one different answer on fp16 is a `noul` at 0.4999 in transformers and 0.5015 here. On CUDA the first prompt at a new length takes about 170 ms, because cuDNN plans its attention for that length. If your prompts vary in length, set `ORT_ENABLE_CUDNN_FLASH_ATTENTION=0`: a first prompt then takes 14 to 44 ms, the times above stay within 1 ms, and the same top answers hold on 48/49 (largest difference 0.0045).
 
 An export without `causal=0` gives the same top answer on only 44 of the 49, with probabilities up to 0.60 apart.
+
+### d1-2B with images
+
+To answer questions about images, build d1-2B with `exclude_embeds=true`. The builder then writes the `lfm3_vl` pipeline of the [LFM3-VL tutorial](lfm3-vl-tutorial.md): the decoder, the vision model, the embedding model and `processor_config.json`. The vision and embedding models are not quantized: they are float32 in the CPU exports and float16 in the CUDA one. Running this export needs an onnxruntime-genai newer than 0.19.0, so until the next release build it from this repository.
+
+```bash
+# CPU
+python onnxruntime-genai/src/python/py/models/builder.py -i ./d1-2b/pytorch -o ./d1-2b/cpu-vl -p int8 -e cpu \
+    --extra_options hf_remote=true exclude_embeds=true prune_lm_head=true
+cp ./d1-2b/pytorch/calibration.json ./d1-2b/cpu-vl/
+
+# NVIDIA GPU
+python onnxruntime-genai/src/python/py/models/builder.py -i ./d1-2b/pytorch -o ./d1-2b/cuda-vl -p fp16 -e cuda \
+    --extra_options hf_remote=true exclude_embeds=true prune_lm_head=true
+cp ./d1-2b/pytorch/calibration.json ./d1-2b/cuda-vl/
+
+python d1-decisions.py -m ./d1-2b/cpu-vl -r cats.json --image cats.jpg
+```
+
+With `cats.json` and `cats.jpg` from [Images](#5-images). The export also answers text questions without `--image`: on 7 of them, the CPU fp32 export's probabilities are within 0.0000014 of transformers on Linux and 0.0000037 on macOS. Besides the points above for `lfm3`:
+
+- Each image is `<|vision_start|><|image|><|vision_end|>` in the prompt, before the state, as in d1-2B's own code. Each question is a whole prompt with the images, so the vision model runs again for each question.
+- `processor_config.json` first shrinks an image above `d1_vision_max_pixels` (1,638,400 pixels in d1-2B's `config.json`) with a bicubic resize, as d1-2B's own code does before its image processor, and leaves smaller images unchanged. LFM3-VL's resize then rounds the sides to multiples of 32. In d1-2B's own code the `D1_VISION_MAX_PIXELS` environment variable overrides the limit; the export reads `config.json` only, so to change it, edit `max_pixels` of the `d1_max_pixels` step in `processor_config.json`.
+- The first resize divides where d1-2B's own code multiplies, so a side can come out one pixel shorter or longer: for 2,173 of the 59,395,690 sizes up to 8192x8192 that it shrinks, 2304x1296 and 1632x1632 among them. For 26 of those, LFM3-VL's resize then gives one row or column of image tokens more or less: 2048x968 gets 1,566 image tokens, against 1,624 in d1-2B's own code. No value in `processor_config.json` removes this.
+- Images 16 pixels or less on the short side and 2,032 or more on the long side get 13 to 46 fewer image tokens than in d1-2B's own code, as LFM3-VL images do (see the [LFM3-VL tutorial](lfm3-vl-tutorial.md)).
+- The script turns off the `chunk_size` search option: a prompt run in chunks would hide later tokens from the full-attention layers.
+
+Measured with `d1-decisions.py` against d1-2B's own `system_one(state, questions, media, set_size=1)` in transformers fp32 at revision `97c57047`, on 54 questions. Each of the 5 pictures in [`test/images`](../../test/images) and `landscape.jpg` enlarged to 2000x1200 got 8 questions (`noul`, `choice` and `score`), 3 questions came with a text state and `sheet.png`, and 3 more with two pictures. Token ids, image tokens included, were equal on all 54.
+
+| Machine, export | same top answer | largest probability difference | with d1-2B's own pixel values |
+| --- | --- | --- | --- |
+| Linux, CPU (Xeon 8480+), fp32 | 54/54 | 0.059 | 0.0000019 |
+| Linux, CPU, int8 | 54/54 | 0.068 | |
+| Linux, CUDA (H100), fp16 | 54/54 | 0.057 | 0.0063 |
+| macOS, CPU (M3 Ultra), fp32 | 53/54 | 0.034 | 0.0000045 |
+| macOS, CPU, int8 | 53/54 | 0.035 | 0.014 |
+
+The differences come from the pixel values. onnxruntime-extensions decodes JPEG files with another decoder than Pillow's: libjpeg 9e on Linux, which rebuilds the colors of subsampled JPEGs (as most photos are) differently, ImageIO on macOS and WIC on Windows (not measured). Values are up to 0.35 apart on the -1 to 1 scale the vision model reads on Linux, and 0.34 on macOS. PNG files decode the same as with Pillow. The first resize gives exactly d1-2B's pixels where the sizes agree, and LFM3-VL's resize stays within 2 levels of 255 of d1-2B's. With d1-2B's own pixel values, the last column, the CPU fp32 export matches transformers as closely as with text. The one different answer on macOS is a `choice` that transformers gives 0.505 against 0.460 and the fp32 export 0.475 against 0.489; with d1-2B's own pixel values it is the same. On the PNG pictures the largest probability difference is 0.0008 on CPU fp32. On PNGs of the three sizes above it is up to 0.02, and 0.05 for 2048x968, with the same top answers on all 24 questions on Linux and macOS. To compare with d1-2B's own code, use PNG files.

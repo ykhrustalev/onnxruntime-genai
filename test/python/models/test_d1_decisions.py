@@ -6,11 +6,14 @@
 The fixture is not d1-3B, but it has an LFM2 tokenizer and an image pipeline. Its dummy decoder gives
 almost the same logits for every prompt, so the tests also check the ids and max_length of each generator.
 
-The d1-2B tests run a tiny random export of the builder's D1Model with the same tokenizer, on CPU.
+The d1-2B tests run a tiny random export of the builder's D1Model with the same tokenizer, on CPU. The d1-2B image
+tests run the builder's lfm3_vl pipeline for a tiny random D1Model with the tokenizer of test/models/lfm3-vl, which
+has single-byte tokens and LFM3-VL's image tokens.
 """
 
 import importlib.util
 import json
+import math
 import shutil
 import subprocess
 import sys
@@ -384,7 +387,7 @@ REFUSALS = {
     "no_digit_token": (q(**URGENCY), {"1"}, False, "single-token digit"),
     "no_alias_left": (q(**TEAM), "all", False, "no single-token alias left for 3 options"),
     "too_long": ({"state": "word " * 5000, "questions": {"q": REFUND}}, None, False, "the model allows 4096"),
-    "images_without_vision": (q(**REFUND), None, True, "images need an lfm2_vl model"),
+    "images_without_vision": (q(**REFUND), None, True, "images need an lfm2_vl or lfm3_vl model"),
 }
 
 
@@ -602,3 +605,171 @@ def test_setup_messages_stay_off_stdout(monkeypatch, capsys, model_path, tmp_pat
     out, err = capsys.readouterr()
     assert list(json.loads(out)["answers"]) == ["refund"]
     assert "Registered a plug-in" in err and "Setting the model's provider" in err
+
+
+def lfm3_vl_tests():
+    """The LFM3-VL model tests' module, which builds the builder's lfm3_vl pipeline for a stand-in checkpoint."""
+    import test_lfm3_vl_models  # noqa: PLC0415
+
+    return test_lfm3_vl_models
+
+
+@pytest.fixture(scope="module")
+def d1_2b_vl_path(request, tmp_path_factory):
+    """A tiny random stand-in for a d1-2B export with images, built by the builder, with the LFM3-VL test model's
+    tokenizer."""
+    data = request.config.getoption("--test_models")
+    if not data or not (Path(data) / "lfm3-vl" / "genai_config.json").exists():
+        pytest.skip(f"LFM3-VL test model not found in {data}")
+    vl_tests = lfm3_vl_tests()
+    vl_tests._builder_tests()
+    from _builder_test_utils import ort_runs_bidirectional_group_query_attention  # noqa: PLC0415
+
+    if not ort_runs_bidirectional_group_query_attention():
+        pytest.skip("this onnxruntime cannot run d1-2B's GroupQueryAttention with causal=0")
+    output, _, _ = vl_tests._build_stand_in_pipeline(data, tmp_path_factory.mktemp("d1-2b-vl"), d1=True)
+    (output / "calibration.json").write_text(json.dumps({"default": TEMPERATURE, "temperatures": {}}), encoding="utf-8")
+    return str(output)
+
+
+@pytest.fixture(scope="module")
+def d1_2b_vl_model(d1_2b_vl_path):
+    return og.Model(d1_2b_vl_path)
+
+
+@pytest.fixture
+def d1_2b_vl(d1_2b_vl_model, d1_2b_vl_path):
+    return d1.D1Decisions(d1_2b_vl_model, d1_2b_vl_path)
+
+
+def png_file(directory, width, height, seed=0):
+    vl_tests = lfm3_vl_tests()
+    path = Path(directory) / f"{width}x{height}-{seed}.png"
+    path.write_bytes(vl_tests._png(vl_tests._random_pixels(height, width, seed)))
+    return str(path)
+
+
+VL_IMAGE = "<|vision_start|><|image|><|vision_end|>"
+# The lfm3-vl tokenizer has single-byte tokens, so a choice reads only its letter and a score its digit.
+VL_TEAM = "Which team?\n\nOptions:\nA Charges, refunds\nB technical\nC fraud team" + CODE
+VL_URGENCY = "Urgent?\n\n0 Can wait\n1 Today\n\nReply with a single digit 0-1 only."
+
+
+@pytest.mark.parametrize("num_images", [0, 1], ids=["text", "image"])
+def test_d1_2b_vl_gives_each_question_a_whole_prompt(d1_2b_vl_model, d1_2b_vl, runs, tmp_path, num_images):
+    # As with text, each question is one prompt that the processor reads with the images; nothing is appended.
+    tokenizer, processor = og.Tokenizer(d1_2b_vl_model), d1_2b_vl_model.create_multimodal_processor()
+    paths = [png_file(tmp_path, 96, 64)] * num_images
+    texts = {"team": VL_TEAM, "urgency": VL_URGENCY}
+    groups = {
+        "team": [tokenizer.encode(code).tolist() for code in "ABC"],
+        "urgency": [tokenizer.encode(digit).tolist() for digit in "01"],
+    }
+    assert all(len(group) == 1 for group in groups["team"] + groups["urgency"])
+    expected_ids, expected = [], {}
+    for name, text in texts.items():
+        prompt = HEAD + VL_IMAGE * num_images + S + text + D1_2B_TAIL
+        inputs = processor(prompt, images=og.Images.open(*paths)) if paths else None
+        ids = inputs["input_ids"].as_numpy()[0].tolist() if paths else tokenizer.encode(prompt).tolist()
+        expected_ids.append(ids)
+        expected[name] = reference_probabilities(d1_2b_vl_model, groups[name], ids, inputs, TEMPERATURE)
+
+    response = d1_2b_vl.decide({"state": STATE, "questions": {"team": TEAM, "urgency": URGENCY}}, paths)
+
+    assert runs.ids == expected_ids
+    assert runs.max_lengths == [len(ids) for ids in expected_ids]
+    assert response["usage"] == {"input_tokens": sum(map(len, expected_ids)), "output_tokens": 0}
+    # 64x96 pixels in 4-pixel patches merged 2x2: 96 image tokens in each prompt
+    assert [ids.count(tokenizer.to_token_id("<|image|>")) for ids in expected_ids] == [96 * num_images] * 2
+    for name, probs in expected.items():
+        np.testing.assert_allclose(list(response["answers"][name]["probabilities"].values()), probs, rtol=0, atol=1e-12)
+
+
+def last_logits(model, inputs):
+    params = PARAMS(model)
+    params.set_search_options(max_length=inputs["input_ids"].as_numpy().shape[1])
+    generator = GENERATOR(model, params)
+    generator.set_inputs(inputs)
+    return generator.get_logits()[0, -1].copy()
+
+
+def test_d1_2b_vl_turns_off_chunked_prefill(d1_2b_vl_model, d1_2b_vl_path, tmp_path):
+    # A prompt run in chunks would hide later tokens from the full-attention layers, which d1-2B reads both ways.
+    chunked_path = tmp_path / "chunked"
+    shutil.copytree(d1_2b_vl_path, chunked_path)
+    lfm3_vl_tests()._edit_json(chunked_path / "genai_config.json", lambda c: c["search"].update(chunk_size=16))
+    chunked_model = og.Model(str(chunked_path))
+    paths = [png_file(tmp_path, 96, 64)]
+    prompt = HEAD + VL_IMAGE + S + VL_TEAM + D1_2B_TAIL
+    inputs = d1_2b_vl_model.create_multimodal_processor()(prompt, images=og.Images.open(*paths))
+    assert np.abs(last_logits(chunked_model, inputs) - last_logits(d1_2b_vl_model, inputs)).max() > 1e-3
+
+    request = {"state": STATE, "questions": {"team": TEAM}}
+    chunked = d1.D1Decisions(chunked_model, str(chunked_path)).decide(request, paths)
+    whole = d1.D1Decisions(d1_2b_vl_model, d1_2b_vl_path).decide(request, paths)
+
+    np.testing.assert_allclose(
+        list(chunked["answers"]["team"]["probabilities"].values()),
+        list(whole["answers"]["team"]["probabilities"].values()),
+        rtol=0,
+        atol=1e-6,
+    )
+
+
+def test_d1_2b_vl_shrinks_large_images_as_d1_does(d1_2b_vl_model, d1_2b_vl_path, tmp_path):
+    # d1-2B's own code shrinks an image above d1_vision_max_pixels with Pillow's bicubic resize, truncating each side,
+    # before its image processor rounds the sides to multiples of 8. One resize to that many pixels would round the
+    # sides of this 200x100 image down to 176x88 instead.
+    max_pixels = lfm3_vl_tests()._builder_tests().D1_MAX_PIXELS
+    width, height = 200, 100
+    scale = math.sqrt(max_pixels / (width * height))
+    assert (int(width * scale), int(height * scale)) == (181, 90)
+    path = png_file(tmp_path, width, height)
+    prompt = HEAD + VL_IMAGE + S + VL_TEAM + D1_2B_TAIL
+    inputs = d1_2b_vl_model.create_multimodal_processor()(prompt, images=og.Images.open(path))
+    # 88x184 pixels in 4-pixel patches
+    assert inputs["image_grid_thw"].as_numpy().tolist() == [[1, 22, 46]]
+
+    image = pytest.importorskip("PIL.Image")
+    shrunk = tmp_path / "shrunk.png"
+    image.open(path).resize((181, 90), image.Resampling.BICUBIC).save(shrunk)
+    uncapped_path = tmp_path / "uncapped"
+    shutil.copytree(d1_2b_vl_path, uncapped_path)
+
+    def drop_cap(config):
+        transforms = config["processor"]["transforms"]
+        transforms[:] = [t for t in transforms if t["operation"]["name"] != "d1_max_pixels"]
+
+    lfm3_vl_tests()._edit_json(uncapped_path / "processor_config.json", drop_cap)
+    uncapped = og.Model(str(uncapped_path)).create_multimodal_processor()(prompt, images=og.Images.open(str(shrunk)))
+    np.testing.assert_array_equal(inputs["pixel_values"].as_numpy(), uncapped["pixel_values"].as_numpy())
+
+
+@pytest.mark.parametrize(
+    "arguments,code,message",
+    [
+        ([], 0, None),
+        (["-e", "WebGpuExecutionProvider"], 2, "error: d1-2B runs on the CPU and CUDA providers only"),
+    ],
+    ids=["follow_config", "webgpu"],
+)
+def test_d1_2b_vl_command_line(d1_2b_vl_path, tmp_path, arguments, code, message):
+    request = tmp_path / "request.json"
+    request.write_text(json.dumps({"state": None, "questions": {"team": TEAM}}), encoding="utf-8")
+    image = png_file(tmp_path, 96, 64)
+
+    script = str(EXAMPLES_DIR / "d1-decisions.py")
+    result = subprocess.run(
+        [sys.executable, script, "-m", d1_2b_vl_path, "-r", str(request), "--image", image, *arguments],
+        capture_output=True,
+        encoding="utf-8",
+        check=False,
+        timeout=300,
+    )
+
+    assert result.returncode == code, result.stderr
+    if message is None:
+        assert json.loads(result.stdout)["answers"]["team"]["choice"] in TEAM["criteria"]
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr

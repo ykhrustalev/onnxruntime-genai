@@ -915,7 +915,6 @@ def test_d1_export_reads_later_tokens_where_a_causal_export_cannot(tmp_path):
         ("dml", ir.DataType.FLOAT16, {}, "causal=0, which ONNX Runtime has on CPU and CUDA, not dml"),
         ("trt-rtx", ir.DataType.FLOAT16, {}, "causal=0, which ONNX Runtime has on CPU and CUDA, not trt-rtx"),
         ("cuda", ir.DataType.FLOAT16, {"use_paged_attention": True}, "PagedAttention"),
-        ("cpu", ir.DataType.FLOAT, {"exclude_embeds": True}, "exclude_embeds=true is not supported"),
         # The same refusals as LFM3 text.
         ("cuda", ir.DataType.FLOAT, {}, "selects Attention"),
         ("cpu", ir.DataType.FLOAT16, {}, "selects MultiHeadAttention"),
@@ -982,7 +981,7 @@ def _load_builder_entrypoint_module():
         # shortens to "lfm3".
         ("Lfm3ForCausalLM", "AutoModelForCausalLM", "Lfm3ForCausalLM", "Lfm3ForCausalLM"),
         ("Lfm3OmniForConditionalGeneration", "AutoModelForMultimodalLM", "lfm3", "lfm3_omni"),
-        # d1-2B refuses exclude_embeds until the builder writes its vision and embedding models.
+        # With exclude_embeds d1-2B is the lfm3_vl pipeline, which test_lfm3_vl.py checks.
         ("D1Model", "AutoModel", "lfm3", None),
     ],
 )

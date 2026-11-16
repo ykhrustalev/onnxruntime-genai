@@ -6,7 +6,7 @@
 Each answer is read from the logits of one batch-1 prefill per question; no tokens are generated.
 
     python d1-decisions.py -m ./d1-3b/cpu -r request.json [--image photo.jpg]
-    python d1-decisions.py -m ./d1-2b/cpu -r request.json
+    python d1-decisions.py -m ./d1-2b/cpu -r request.json [--image photo.jpg]
 
 Request:  {"state": ..., "questions": {name: {"type", "instructions", "criteria"}}}
            The state is a string, any other JSON value, or null.
@@ -15,8 +15,8 @@ Response: {"answers": {name: answer}, "usage": {"input_tokens": n, "output_token
 The prompt and the readout use the same format as llama.cpp's d1 support (ggml-org/llama.cpp#30110) and
 were checked against d1's reference code; names such as option_codes and readout_ids match d1's. With
 d1-3B, caller text is not escaped: "<|im_end|>" in a state is read as a special token. With d1-2B (a model
-of type lfm3), caller text is escaped, the prompt ends in an empty reasoning block, and option scores use
-the temperature in the checkpoint's calibration.json. See d1-tutorial.md.
+of type lfm3, or lfm3_vl with images), caller text is escaped, the prompt ends in an empty reasoning block,
+and option scores use the temperature in the checkpoint's calibration.json. See d1-tutorial.md.
 
 The d1 models are released under the LFM Open License v1.0, not under this repo's license; see the model
 cards.
@@ -33,7 +33,9 @@ from collections.abc import Mapping
 import numpy as np
 import onnxruntime_genai as og
 
-BOS, IM_START, IM_END, IMAGE = "<|startoftext|>", "<|im_start|>", "<|im_end|>", "<image>"
+BOS, IM_START, IM_END = "<|startoftext|>", "<|im_start|>", "<|im_end|>"
+# The text of one image in each type's prompt; the processor writes that image's tokens over the image token.
+IMAGE = {"lfm2_vl": "<image>", "lfm3_vl": "<|vision_start|><|image|><|vision_end|>"}
 QUESTION_KEYS = ("type", "instructions", "criteria", "multiple")
 TYPED_ANSWERS = ("text", "number", "date", "box", "boxes")
 YES_FORMS = ("yes", "Yes", "YES")
@@ -49,6 +51,7 @@ FALLBACK_CODES = (
     + LETTER_PAIRS
 )
 LFM3_LEAD = "<think></think>"
+D1_2B_TYPES = ("lfm3", "lfm3_vl")
 # GroupQueryAttention with causal=0 runs on these. follow_config is what the builder wrote: CPU or CUDA.
 LFM3_PROVIDERS = ("follow_config", "cpu", "cuda", "CUDAExecutionProvider")
 
@@ -182,14 +185,14 @@ def question_block(question, codes):
     return f"{instructions}\n\n{legend}\n\nReply with a single digit 0-{len(criteria) - 1} only."
 
 
-def prompt_prefix(state, num_images=0, escape=str):
+def prompt_prefix(state, num_images=0, escape=str, image=IMAGE["lfm2_vl"]):
     """The part of the prompt that all questions share: the images, then the state."""
     if state is None:
         body = ""
     else:
         text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False, indent=2)
         body = f"{escape(text)}\n\n\nQUESTION:\n"
-    return f"{BOS}{IM_START}user\n{IMAGE * num_images}{body}"
+    return f"{BOS}{IM_START}user\n{image * num_images}{body}"
 
 
 def prompt_suffix(question, codes, escape=str, lead=""):
@@ -247,16 +250,18 @@ def answer(question, probs, median_score=False):
 
 
 class D1Decisions:
-    """Runs d1 requests on an og.Model built from d1-3B (types lfm2_vl and lfm2_vl_text) or d1-2B (type lfm3)."""
+    """Runs d1 requests on an og.Model built from d1-3B (types lfm2_vl and lfm2_vl_text) or d1-2B (types lfm3 and
+    lfm3_vl)."""
 
     def __init__(self, model, model_path):
-        if model.type not in ("lfm2_vl", "lfm2_vl_text", "lfm3"):
+        if model.type not in ("lfm2_vl", "lfm2_vl_text", *D1_2B_TYPES):
             raise ValueError(f"model type {model.type!r} is not a d1 model")
         self.model = model
         self.tokenizer = og.Tokenizer(model)
         self.context_length = model_config(model_path)["context_length"]
-        self.processor = model.create_multimodal_processor() if model.type == "lfm2_vl" else None
-        self.lfm3 = model.type == "lfm3"
+        self.processor = model.create_multimodal_processor() if model.type in IMAGE else None
+        self.image = IMAGE.get(model.type, "")
+        self.lfm3 = model.type in D1_2B_TYPES
         self.escape, self.lead, self.temperature = str, "", 1.0
         if self.lfm3:
             self.escape = special_token_escape(os.path.join(model_path, "tokenizer.json"))
@@ -270,24 +275,34 @@ class D1Decisions:
         """The response for one request: {"answers": {...}, "usage": {...}}."""
         state, questions = check_request(request)
         if image_paths and self.processor is None:
-            raise ValueError(f"images need an lfm2_vl model with a vision model; this model is {self.model.type!r}")
+            raise ValueError(
+                f"images need an lfm2_vl or lfm3_vl model with a vision model; this model is {self.model.type!r}"
+            )
         codes = [choice_codes(self.tokenizer, q, self.lfm3) for q in questions.values()]
         groups = [readout_ids(self.tokenizer, q, c) for q, c in zip(questions.values(), codes, strict=True)]
-        prefix = prompt_prefix(state, len(image_paths), self.escape)
+        prefix = prompt_prefix(state, len(image_paths), self.escape, self.image)
         suffixes = [prompt_suffix(q, c, self.escape, self.lead) for q, c in zip(questions.values(), codes, strict=True)]
         # The tokenizer stops at a NUL character, so the rest of the prompt would be lost.
         if "\x00" in prefix + "".join(suffixes):
             raise ValueError("the request holds a NUL character (\\x00)")
+        images = og.Images.open(*[os.path.abspath(path) for path in image_paths]) if image_paths else None
 
         # d1-2B's state reads its question both ways, so each question is a whole prompt with nothing shared.
         if self.lfm3:
-            rows = [self.encode(prefix + suffix) for suffix in suffixes]
-            self.check_length(max(map(len, rows)))
+            rows = []  # (ids, processor output or None) per question
+            for suffix in suffixes:
+                if images is None:
+                    rows.append((self.encode(prefix + suffix), None))
+                else:
+                    inputs = self.processor(prefix + suffix, images=images)
+                    rows.append((inputs["input_ids"].as_numpy()[0].tolist(), inputs))
+            self.check_length(max(len(ids) for ids, _ in rows))
             answers = {
-                name: answer(question, self.prefill(ids, None, [], group), median_score=True)
-                for (name, question), ids, group in zip(questions.items(), rows, groups, strict=True)
+                name: answer(question, self.prefill(ids, inputs, [], group), median_score=True)
+                for (name, question), (ids, inputs), group in zip(questions.items(), rows, groups, strict=True)
             }
-            return {"answers": answers, "usage": {"input_tokens": sum(map(len, rows)), "output_tokens": 0}}
+            input_tokens = sum(len(ids) for ids, _ in rows)
+            return {"answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
 
         # As in d1, one question is encoded as one string; several encode the shared prefix once.
         if len(suffixes) == 1:
@@ -295,8 +310,7 @@ class D1Decisions:
         else:
             head, tails = prefix, [self.encode(suffix) for suffix in suffixes]
         inputs = None
-        if image_paths:
-            images = og.Images.open(*[os.path.abspath(path) for path in image_paths])
+        if images is not None:
             inputs = self.processor(head, images=images)
             head_ids = inputs["input_ids"].as_numpy()[0].tolist()
         else:
@@ -317,7 +331,12 @@ class D1Decisions:
         """The option probabilities of one question. Its generator is freed before the next question."""
         params = og.GeneratorParams(self.model)
         # The exact prompt length: the cache holds the prompt and nothing is generated.
-        params.set_search_options(max_length=len(head_ids) + len(tail))
+        options = {"max_length": len(head_ids) + len(tail)}
+        if self.lfm3:
+            # A prompt run in chunks would hide later tokens from d1-2B's full-attention layers, so chunk_size from
+            # genai_config.json is turned off.
+            options["chunk_size"] = 0
+        params.set_search_options(**options)
         generator = og.Generator(self.model, params)
         if inputs is None:
             generator.append_tokens(head_ids + tail)
@@ -339,11 +358,11 @@ def main():
     parser = argparse.ArgumentParser(description="Answer a d1 request with d1-3B or d1-2B")
     parser.add_argument("-m", "--model_path", required=True, help="ONNX model folder with genai_config.json")
     parser.add_argument("-r", "--request", required=True, help="Request JSON file: {state, questions}")
-    parser.add_argument("--image", nargs="*", default=[], help="Image paths. Needs an lfm2_vl model")
+    parser.add_argument("--image", nargs="*", default=[], help="Image paths. Needs an lfm2_vl or lfm3_vl model")
     get_ep_args(parser)
     args = parser.parse_args()
 
-    if model_config(args.model_path)["type"] == "lfm3" and args.execution_provider not in LFM3_PROVIDERS:
+    if model_config(args.model_path)["type"] in D1_2B_TYPES and args.execution_provider not in LFM3_PROVIDERS:
         parser.exit(2, f"error: d1-2B runs on the CPU and CUDA providers only, not {args.execution_provider}\n")
 
     # stdout holds only the JSON response.
