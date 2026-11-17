@@ -126,7 +126,7 @@ The request and the answers have the same shape as d1's own `system_one()`.
 
 `usage.input_tokens` counts the shared part of the prompt once, plus each question, as d1 does.
 
-Before it runs the model, the script refuses a request with other fields in the request or a question, an unknown `type`, a typed answer such as `box`, a choice with `"multiple": true`, missing `instructions`, bad `criteria`, a NUL character, a prompt longer than the model's context, or images for a model without a vision model. The command line then prints one `error: ...` line and exits with code 2.
+Before it runs the model, the script refuses a request with other fields in the request or a question, an unknown `type`, a typed answer such as `box`, a choice with `"multiple": true`, missing `instructions`, bad `criteria`, a NUL character, or images for a model without a vision model. It also refuses a prompt longer than the model's context: with d1-3B before it runs the model, with d1-2B just before it runs the question whose prompt is too long, after the earlier questions have run. The command line then prints one `error: ...` line and exits with code 2.
 
 ## 5. Images
 

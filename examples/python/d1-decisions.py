@@ -289,19 +289,14 @@ class D1Decisions:
 
         # d1-2B's state reads its question both ways, so each question is a whole prompt with nothing shared.
         if self.lfm3:
-            rows = []  # (ids, processor output or None) per question
-            for suffix in suffixes:
-                if images is None:
-                    rows.append((self.encode(prefix + suffix), None))
-                else:
-                    inputs = self.processor(prefix + suffix, images=images)
-                    rows.append((inputs["input_ids"].as_numpy()[0].tolist(), inputs))
-            self.check_length(max(len(ids) for ids, _ in rows))
-            answers = {
-                name: answer(question, self.prefill(ids, inputs, [], group), median_score=True)
-                for (name, question), (ids, inputs), group in zip(questions.items(), rows, groups, strict=True)
-            }
-            input_tokens = sum(len(ids) for ids, _ in rows)
+            answers, input_tokens = {}, 0
+            # One question at a time: each processor output holds its own copy of the image tensors.
+            for (name, question), suffix, group in zip(questions.items(), suffixes, groups, strict=True):
+                inputs = None if images is None else self.processor(prefix + suffix, images=images)
+                ids = self.encode(prefix + suffix) if inputs is None else inputs["input_ids"].as_numpy()[0].tolist()
+                self.check_length(len(ids))
+                answers[name] = answer(question, self.prefill(ids, inputs, [], group), median_score=True)
+                input_tokens += len(ids)
             return {"answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
 
         # As in d1, one question is encoded as one string; several encode the shared prefix once.
@@ -323,9 +318,9 @@ class D1Decisions:
         input_tokens = len(head_ids) + sum(len(tail) for tail in tails)
         return {"answers": answers, "usage": {"input_tokens": input_tokens, "output_tokens": 0}}
 
-    def check_length(self, longest):
-        if longest > self.context_length:
-            raise ValueError(f"the prompt has {longest} tokens; the model allows {self.context_length}")
+    def check_length(self, length):
+        if length > self.context_length:
+            raise ValueError(f"the prompt has {length} tokens; the model allows {self.context_length}")
 
     def prefill(self, head_ids, inputs, tail, group):
         """The option probabilities of one question. Its generator is freed before the next question."""
@@ -341,7 +336,7 @@ class D1Decisions:
         if inputs is None:
             generator.append_tokens(head_ids + tail)
         else:
-            generator.set_inputs(inputs)  # only reads the processor output, so every question reuses it
+            generator.set_inputs(inputs)  # only reads the processor output, so d1-3B's questions can share one
             if tail:
                 generator.append_tokens(tail)
         return probabilities(generator.get_logits()[0, -1], group, self.temperature)

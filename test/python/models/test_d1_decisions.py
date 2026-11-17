@@ -685,6 +685,19 @@ def test_d1_2b_vl_gives_each_question_a_whole_prompt(d1_2b_vl_model, d1_2b_vl, r
         np.testing.assert_allclose(list(response["answers"][name]["probabilities"].values()), probs, rtol=0, atol=1e-12)
 
 
+def test_d1_2b_vl_runs_each_question_before_processing_the_next(monkeypatch, d1_2b_vl, runs, tmp_path):
+    # Each processor output holds its own copy of the image tensors, so they must not pile up over the questions.
+    process, runs_before = d1_2b_vl.processor, []
+
+    def counting(*args, **kwargs):
+        runs_before.append(len(runs.ids))
+        return process(*args, **kwargs)
+
+    monkeypatch.setattr(d1_2b_vl, "processor", counting)
+    d1_2b_vl.decide({"state": STATE, "questions": {"team": TEAM, "urgency": URGENCY}}, [png_file(tmp_path, 96, 64)])
+    assert runs_before == [0, 1]
+
+
 def last_logits(model, inputs):
     params = PARAMS(model)
     params.set_search_options(max_length=inputs["input_ids"].as_numpy().shape[1])
