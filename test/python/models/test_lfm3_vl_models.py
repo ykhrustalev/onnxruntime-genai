@@ -160,10 +160,13 @@ def test_lfm3_vl_single_prompt_list_matches_the_string_form(test_data_path):
         np.testing.assert_array_equal(inputs[name].as_numpy(), expected[name].as_numpy())
 
 
-def _generator(model, inputs, chunk_size=None, max_length=4096):
+def _generator(model, inputs, chunk_size=None, max_length=4096, min_length=0):
     params = og.GeneratorParams(model)
     params.set_search_options(
-        do_sample=False, max_length=max_length, **({"chunk_size": chunk_size} if chunk_size else {})
+        do_sample=False,
+        min_length=min_length,
+        max_length=max_length,
+        **({"chunk_size": chunk_size} if chunk_size else {}),
     )
     generator = og.Generator(model, params)
     generator.set_inputs(inputs)
@@ -493,6 +496,25 @@ def test_lfm3_vl_builder_makes_a_working_pipeline(test_data_path, tmp_path):
     assert generator.get_sequence(0).shape[0] == len(input_ids) + 1
 
 
+def _generate_stand_in(model, chunk_size, follow=None):
+    """The generator after 24 greedy steps over two images, and each step's logits. The search never takes <|image|>,
+    which the stand-in's embedding model fails on. Given follow, it reads those logits instead of the model's, so a run
+    takes another run's tokens even at an fp16 near tie."""
+    inputs = model.create_multimodal_processor()(_prompt(2), images=_images((64, 96), (64, 64)))
+    max_length = inputs["input_ids"].as_numpy().shape[1] + 24
+    # No EOS before max_length, so every run takes all 24 steps
+    generator = _generator(model, inputs, chunk_size, max_length, min_length=max_length)
+    image_token = og.Tokenizer(model).to_token_id(IMAGE_TOKEN)
+    logits = []
+    while not generator.is_done():
+        logits.append(generator.get_logits())
+        search_logits = (logits[-1] if follow is None else follow[len(logits) - 1]).copy()
+        search_logits[..., image_token] = np.finfo(np.float32).min
+        generator.set_logits(search_logits)
+        generator.generate_next_token()
+    return generator, np.stack(logits)
+
+
 # The images give 160 tokens against the stand-in's 4-token window, so the prompt, its chunks and every step evict from
 # the window.
 @pytest.mark.parametrize("chunk_size", [None, 64])
@@ -506,34 +528,48 @@ def test_lfm3_vl_window_sized_kv_caches_match_full_caches(test_data_path, tmp_pa
     io_dtype = builder_tests.ir.DataType.FLOAT16 if ep == "cuda" else builder_tests.ir.DataType.FLOAT
     sliding_layer = builder_tests.stand_in_config(tmp_path).text_config.layer_types.index("sliding_attention")
 
-    def generate(name, extra_options):
+    def generate(name, extra_options, follow=None):
         (tmp_path / name).mkdir()
         output, config, _ = _build_stand_in_pipeline(test_data_path, tmp_path / name, ep, io_dtype, extra_options)
-        model = og.Model(os.fspath(output))
-        inputs = model.create_multimodal_processor()(_prompt(2), images=_images((64, 96), (64, 64)))
-        max_length = inputs["input_ids"].as_numpy().shape[1] + 24
-        params = og.GeneratorParams(model)
-        # No EOS before max_length, so the steps run through several evictions
-        params.set_search_options(
-            do_sample=False,
-            min_length=max_length,
-            max_length=max_length,
-            **({"chunk_size": chunk_size} if chunk_size else {}),
-        )
-        generator = og.Generator(model, params)
-        generator.set_inputs(inputs)
-        logits = []
-        while not generator.is_done():
-            logits.append(generator.get_logits())
-            generator.generate_next_token()
+        generator, logits = _generate_stand_in(og.Model(os.fspath(output)), chunk_size, follow)
         sliding_length = generator.get_input(f"past_key_values.{sliding_layer}.key").shape[2]
-        window = config.text_config.sliding_window
-        return generator.get_sequence(0).copy(), np.stack(logits), sliding_length, window, max_length
+        return generator.get_sequence(0).copy(), logits, sliding_length, config.text_config.sliding_window
 
-    sequence, logits, sliding_length, window, max_length = generate("windowed", {})
-    expected_sequence, expected_logits, full_length, _, _ = generate("full", {"windowed_kv_cache": False})
+    expected_sequence, expected_logits, full_length, _ = generate("full", {"windowed_kv_cache": False})
+    # On CUDA a one-ulp fp16 difference between the caches can flip a near tie.
+    sequence, logits, sliding_length, window = generate("windowed", {}, follow=None if ep == "cpu" else expected_logits)
 
     assert sliding_length == window + test_lfm3.CACHE_SLACK[ep]
-    assert full_length == max_length
+    assert full_length == len(expected_sequence)
     np.testing.assert_array_equal(sequence, expected_sequence)
     np.testing.assert_allclose(logits, expected_logits, rtol=0, atol=test_lfm3.ATOL[ep])
+
+
+def _cuda_export(test_data_path, tmp_path, extra_options):
+    if not og.is_cuda_available():
+        pytest.skip("needs the CUDA build of onnxruntime_genai")
+    fp16 = _builder_tests().ir.DataType.FLOAT16
+    return _build_stand_in_pipeline(test_data_path, tmp_path, "cuda", fp16, extra_options)[0]
+
+
+def _with_graph_capture(model_dir, capture):
+    config = og.Config(os.fspath(model_dir))
+    config.set_provider_option("cuda", "enable_cuda_graph", capture)
+    return og.Model(config)
+
+
+def test_lfm3_vl_window_sized_kv_caches_refuse_cuda_graph_capture(test_data_path, tmp_path):
+    model = _with_graph_capture(_cuda_export(test_data_path, tmp_path, {}), "1")
+    with pytest.raises(RuntimeError, match="window-sized KV caches"):
+        og.Generator(model, og.GeneratorParams(model))
+
+
+# The prompt, whole or in chunks, runs without capture; the steps after it replay the captured decoder.
+@pytest.mark.parametrize("chunk_size", [None, 64])
+def test_lfm3_vl_cuda_graph_capture_matches_no_capture(test_data_path, tmp_path, chunk_size):
+    output = _cuda_export(test_data_path, tmp_path, {"enable_cuda_graph": True})
+    import test_lfm3  # noqa: PLC0415
+
+    _, expected_logits = _generate_stand_in(_with_graph_capture(output, "0"), chunk_size)
+    _, logits = _generate_stand_in(_with_graph_capture(output, "1"), chunk_size, follow=expected_logits)
+    np.testing.assert_allclose(logits, expected_logits, rtol=0, atol=test_lfm3.ATOL["cuda"])

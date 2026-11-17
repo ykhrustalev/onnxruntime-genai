@@ -639,6 +639,13 @@ def test_lfm3_cuda_graph_capture_needs_full_length_kv_caches(tmp_path):
         # The decoder of the lfm3_vl pipeline
         ("cpu", ir.DataType.FLOAT, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, True),
         ("cuda", ir.DataType.FLOAT16, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, True),
+        (
+            "cuda",
+            ir.DataType.FLOAT16,
+            "Lfm3VlForConditionalGeneration",
+            {"exclude_embeds": True, "enable_cuda_graph": True},
+            False,
+        ),
         ("webgpu", ir.DataType.FLOAT16, "Lfm3VlForConditionalGeneration", {"exclude_embeds": True}, False),
         ("cpu", ir.DataType.FLOAT, "Lfm3AudioForConditionalGeneration", {"exclude_embeds": True}, False),
         ("cpu", ir.DataType.FLOAT, "Lfm3OmniForConditionalGeneration", {"exclude_embeds": True}, False),

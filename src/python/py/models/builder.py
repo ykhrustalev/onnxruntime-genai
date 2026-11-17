@@ -1224,9 +1224,10 @@ def get_args():
                     With paged attention, eligible local layers use a ring of blocks while at least one full-context
                     layer remains. Without paged attention, supported execution providers use their windowed-cache
                     mode. Set to false to give every layer a full-length KV cache for comparison or compatibility.
-                    LFM3 has window-sized KV caches only in text exports for CPU and CUDA without paged attention or
-                    enable_cuda_graph; other exports keep full-length caches. An older onnxruntime-genai fails on
-                    LFM3 exports with window-sized caches on CUDA, and the WebGPU provider does not load them.
+                    LFM3 has window-sized KV caches only in text and LFM3-VL exports for CPU and CUDA without paged
+                    attention or enable_cuda_graph; other exports (including the LFM3-Audio and LFM3-Omni decoders
+                    with exclude_embeds) keep full-length caches. An older onnxruntime-genai fails on LFM3 exports
+                    with window-sized caches on CUDA, and the WebGPU provider does not load them.
                 gpu_utilization_factor = Fraction of available GPU memory used for the paged KV-cache. Default is 0.6.
                     Must be greater than 0 and at most 1.
                 max_batch_size = Maximum number of requests in a dynamic batch. Default is 100.
